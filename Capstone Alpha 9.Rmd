@@ -1,0 +1,714 @@
+---
+title: "Capstone"
+author: "Matthew Cooke"
+date: "July 3, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#install.packages("FactoMineR")
+#library(FactoMineR)
+#install.packages("cba")
+#library(cba)
+```
+#Introduction
+We're looking at Mortality data from the US Centre for Disease Control
+Lists all deaths recorded in 2015. There are ~2.6 million of them
+Retrieved from: https://www.cdc.gov/nchs/data_access/vitalstatsonline.htm#Mortality_Multiple
+
+#Loading the data
+This is a fixed width file in DUSMCPUB format, so importing requires a look at the documentation pdf provided at the above link
+Columns of form X## are dummy variables, with the exception of X27 which is a list of 20x2 contributing causes of death. The import code was handily provided by R for Dummies.
+```{r}
+mort15 <- read.fwf(file="VS15MORT.DUSMCPUB",
+                    widths= c(19,1,40,2,1,1,2,2,1,4,1,2,2,2,2,1,1,1,16,4,1,1,1,1,
+                                34,1,1,4,3,1,3,3,2,283,2,1,1,1,1,33,3,1,1),
+                    col.names= c("X0","ResidentStatus","X1","Education1989",
+                                   "Education2003","EducationFlag","MonthOfDeath",
+                                   "X5","Sex","AgeDetail","AgeSubstitution",
+                                   "AgeRecode52","AgeRecode27","AgeRecode12",
+                                   "AgeRecodeInfant22","PlaceOfDeath","MaritalStatus",
+                                   "DayOfWeekofDeath","X15","CurrentDataYear",
+                                   "InjuryAtWork","MannerOfDeath","MethodOfDisposition",
+                                   "Autopsy","X20","ActivityCode","PlaceOfInjury",
+                                   "ICDCode","CauseRecode358","X24","CauseRecode113",
+                                   "CauseRecode130","CauseRecode39","X27","Race",
+                                   "BridgeRaceFlag","RaceImputationFlag","RaceRecode3",
+                                   "RaceRecord5","X32","HispanicOrigin","X33",
+                                   "HispanicOriginRecode")
+                    )
+#mort15<-read.csv("Mortality15.csv")
+```
+What are the variables?
+They include: Age & Cause of Death, with various levels of binning, Sex, Type of Death, Place of Injury and Death, 
+Information about education, race, marital status, and so on.
+
+Let's start by getting a look at some of the variables with str and head
+```{r}
+str(mort15)
+head(mort15)
+```
+
+
+
+#Cleaning
+Since this is a very large dataset analysis will take a long time or consume too much memory, unless we prepare the data and eliminate any uninteresting or superfluous records or variables. These can include dummy variables, variables which have 0 variance, entries with missing information, binnings of the same variables and so on. Before we begin it may be prudent to add an id variable so we can keep track of what we've removed so far from the master dataset. (R does this automatically in most cases, but it can be finnicky if you have to reload the data)
+
+```{r}
+mort15[44] <- c(1:2718198) #The starting ID variable
+mort15[,c(1,3,8,19,25,30,40,42)] <- NULL # These are the dummy variables 
+mort15$CurrentDataYear <- NULL #This is $CurrentDataYear, only included for the benefit of those working with data from multiple years
+
+mort15<- mort15[-which(mort15$AgeSubstitution != "NA"),]
+mort15$AgeSubstitution<-NULL #Age substitution indicates records for which age data is unreliable, probably because the people are so old. Since it only includes a handful of records we can delete them all and then purge the column.
+
+length(which(mort15$Education1989 != "NA")) /(length(mort15[,1])) ##Education1989 is an outdated measure of education which is seldom used
+hist(mort15$AgeRecode12[which(mort15$Education1989 != "NA")])#It is used overwhelmingly for older persons
+which(mort15$Education2003[which(mort15$Education1989 != "NA")] != "NA") ##It is recorded for all and only those records for which there 
+##Is no Education2003, at 2.7% of the dataset. We should be able to purge these records and delete the column
+mort15 <- mort15[-which(mort15$Education1989 != "NA"),]
+mort15$Education1989 <- NULL
+
+mort15$EducationFlag <- NULL #This column marks whether Education1989 was used or not.
+mort15[,6:9] <- NULL #These columns are recodes of age into various buckets. These are easy to replace later should we choose to do so.
+
+mort15 <- mort15[-which(mort15$Education == 9),] #9 indicates unknown education. We'll be looking a lot at education later so it's best to prune
+
+#write.csv(mort15, "Mortality15Cleaned.CSV") #Since this takes so long to load we should back up regularly
+#mort15 <- read.csv("Mortality15Cleaned.CSV")
+#mort15[,1] <- NULL
+```
+
+#Prepping Cause of Death
+
+For this analysis we'll be looking a lot at causes of death. These are recorded in the X27 variable, which is over 200 characters long and has 2*20 entries for cause of death and contributing causes of death. One group is Entity-Axis records, the other is Row-Axis, a lightly processed EAC which removes errors, contradictions, and sorts alphabetically all contributing causes of death listed on a patient's death certificate. Since this is such a cumbersome part of the dataset we'll load it into its own data frame. 
+
+```{r}
+#install.packages("tidyr")
+library(tidyr) #We're using the separate function in tidyr
+mort15cod <- NULL
+mort15cod = separate(data=mort15, col=X27, into=
+                   c("neac","eac1","eac2","eac3","eac4","eac5","eac6","eac7","eac8","eac9",
+                     "eac10","eac11","eac12","eac13","eac14","eac15","eac16","eac17","eac18","eac19","eac20","blank",
+                     "nrac","rac1","rac2","rac3","rac4","rac5","rac6","rac7","rac8","rac9","rac10",
+                     "rac11","rac12","rac13","rac14","rac15","rac16","rac17","rac18","rac19","rac20"), 
+                 sep=c(3,7*seq(from=1, to=20)+3,146,182,5*seq(from=1, to=20)+182))[,c(42:62,71)]
+```
+
+We'll just be using RAC in this case, since 39 dimensions is a lot. We also have the number of conditions listed as nrac. rac1 is equal
+to icd10 from the original data frame - the principal cause of death. We also need to keep track of our indicies if we're splitting the data off into a second matrix.
+
+```{r}
+mort15cod$nrac <- as.numeric(mort15cod$nrac)
+
+mort15cod[,2:21] <- apply(mort15cod[,2:21],2,trimws) ##We'll also trim the white space while we're at it to keep everything nice and neat.
+
+str(mort15cod) #Looking good so far
+```
+
+
+
+The clustering techniques we'll be using on this matrix scale very poorly with size, so it would be prudent to eliminate some variables. Records which list a very large number of conditions account for a very small percentage of the dataset so it shouldn't hurt to much to prune them. We can check how many people have a number of conditions >X and remove records which correspond to a very small % of the dataset, say <5%.
+```{r}
+
+length(which(mort15cod[,9]!=""))/length(mort15cod$nrac)  ## Only 2.2% of records have 8 or more conditions listed.
+mort15cod <- mort15cod[-which(mort15cod[,9]!=""),] ##Purge the records
+mort15cod[,9:21]<-NULL ##Drop the columns
+str(mort15cod) ##We can turn this resulting matrix into a categorical matrix for analysis. 
+
+#mort15cod[,2:8] <- apply(mort15cod[,2:8],2,as.factor) ##Why doesn't Apply work with as.factor?
+
+
+h<- c(unique(unlist(apply(mort15cod[,2:8],2,unique)))) #Since COD and RAC are drawn from the same list we might want to keep the levels of every
+#column the same. 
+
+#h[3698] #I ran into some trouble keeping "" as a factor before
+
+mort15cod[,2]<-factor(mort15cod[,2],levels=h)
+mort15cod[,3]<-factor(mort15cod[,3],levels=h)
+mort15cod[,4]<-factor(mort15cod[,4],levels=h)
+mort15cod[,5]<-factor(mort15cod[,5],levels=h)
+mort15cod[,6]<-factor(mort15cod[,6],levels=h)
+mort15cod[,7]<-factor(mort15cod[,7],levels=h)
+mort15cod[,8]<-factor(mort15cod[,8],levels=h)
+
+str(mort15cod)
+
+#To keep things consistent we'll prune the same records in our original dataset.
+mort15 <- mort15[which(mort15$V44 %in% mort15cod$V44),]
+
+h<-NULL #To save memory we can clean up dummy variables after.
+
+#write.csv(mort15, "Mortality15CODPurge.csv")
+#write.csv(mort15cod, "MortalityCODInitial.csv")
+
+#mort15 <- read.csv("Mortality15CODPurge.csv")
+#mort15cod <- read.csv("MortalityCODInitial.csv")
+#mort15[,1] <- NULL
+#mort15cod[,1] <- NULL
+#Keeping backups is important, these things take a long time to reload if you mess up.
+
+
+```
+
+
+#Cleaning Continued
+
+Looking back towards the main dataset we can look at some more bits of cleaning to do. To start, my own interest in this project is to look at persons 18 years of age or older, since childhood diseases are a whole field of study on their own. Additionally age recode variables can be gotten rid of for now, since they're quite easy to replace. Other recode variables like race or cause of death are not as easily replaced as age recodes, and additionally we may want to take a closer look at these with clustering analyses.
+
+
+
+
+```{r}
+mort15 <- mort15[which(mort15$AgeDetail > 1017 & mort15$AgeDetail < 1999),]
+mort15$AgeDetail <- (mort15$AgeDetail -1000) #The ages are stored with the first digit denoting Years/Months/Minutes of life. 1### is years, we don't need the others.
+mort15$CauseRecode130 <- NULL #Recode 130 is specifically for infant mortalities
+mort15$RaceRecord5 <- as.factor(mort15$RaceRecord5) #We'll also be needing this
+
+```
+
+Finally we can look at deaths not directly related to health, such as accidental deaths.
+Initially these may seem to be not all that relevant to what I've mentioned so far, but I have heard from my father, a psychiatrist, that accidental deaths correlate pretty strongly with suicides, and I'd like to test that hypothesis.
+
+
+This means things like homicide, car accidents, and warfare are our candidates for removal. 
+Non-health related deaths can be found by looking in the documentation. The upper registers of CauseRecode358 include all non-disease related deaths including homicide, accidental poisoning, and so on, from bin no. 384 and up. These entries will be moved to another dataset, mort15accidental.
+
+
+The groups 384 and up can be thought of roughly as: 
+
+456 - 453 Medical Malpractise
+452 - 449 Law Enforement / Soldiering
+448 - 442 Unknown Intent death guns/poison
+441 - 432 Assault and Homicide 
+431 - 424 Suicide Self Harm
+423 - 419 Accidental Poisoning
+418 - 416 Acts of Nature
+415 - 407 Accidental / Building Hazard / Choking hazard
+406 - 403 Falling
+402 - 381 Vehicular Accidents
+  390 - 384 Car Driving
+  399 Unspecified
+  400 Boating
+  
+The variable MannerofDeath also includes lists of deaths deemed accidental or unknown in cause. We'll shove aside the inclusion of both groups into mort15accidental.
+
+1 ... Accident
+2 ... Suicide
+3 ... Homicide
+4 ... Pending investigation
+5 ... Could not determine
+6 ... Self-Inflicted
+7 ... Natural                - This is what we want to focus on.
+Blank ... Not specified      - Why this is an option I cannot say
+
+
+```{r}
+mort15accidental <- mort15[-which(mort15$CauseRecode358 < 384),]
+#These are all the self-harm and accidental, ie non-medical deaths
+#We won't include them in our primary analysis, but we will look at them later to compare some results.
+
+
+
+mort15 <- mort15[which(mort15$CauseRecode358 < 384),]
+table(mort15accidental$MannerOfDeath)
+#Even though CauseRecode defines these as more accidental deaths, many are listed as natural. The documentation is very unclear about this.
+table(mort15$MannerOfDeath)
+#The overwhelming of records left over are from natural causes. Curiously many of the records have this value left blank. Since we already 
+#removed CauseRecode358's accidental deaths we could probably assume that the blank records left are natural deaths, but we can double check by 
+#tabling with respect to some other cause of death binning.
+
+length(mort15$MannerOfDeath) - sum(table(mort15$MannerOfDeath)) 
+length(mort15$CauseRecode113[which(is.na(mort15$MannerOfDeath))]) #These should be the same.
+
+
+sort(table(mort15$CauseRecode113[which(is.na(mort15$MannerOfDeath))]),decreasing=T)[1:5] 
+#What are the top 5 causes of death among those who have no manner of death listed?
+#From the documentation they are: Misc. Disease, Chronic Heart Disease, Cerebrovascular Disease, Lung Cancer, and Alzheimers
+#It should be safe to include the NAs in our disease analysis.
+
+length(which(mort15$MannerOfDeath %in% c(1:6)))
+sum(table(mort15$MannerOfDeath)[1:5]) #These should be the same. It's Table[1:5] because 6 is self-harm which had been wiped with cause recodes.
+
+mort15accidental <- rbind.data.frame(mort15accidental, mort15[which(mort15$MannerOfDeath %in% c(1:6)),])
+mort15 <- mort15[-which(mort15$MannerOfDeath %in% c(1:6)),]
+
+mort15cod <- mort15cod[which(mort15cod$V44 %in% mort15$V44),]
+#write.csv(mort15accidental, "mort15accidental.csv")
+#write.csv(mort15, "mort15pacc.csv")
+#write.csv(mort15, "mort15codpacc.csv")
+```
+
+With these row exclusions out of the way we can start looking at some more in depth analysis.
+
+
+#Data Analysis §1
+
+The first step in a good analysis is to get a better understanding of the data and the trends in it.
+Let's start by making a few visualizations, and asking some basic questions.
+Some questions we might ask are...
+
+1) When do people die?
+2) How old are people when they die?
+3) What are the differences between men and women?
+4) What are the most common means of death?
+5) How do various factors influence Age of Death Re:gression
+6) What is the distribution of these variables? - Normal? Skew? Flat?
+
+```{r}
+hist(mort15$MonthOfDeath)
+```
+
+As expected the colder months are not kind to the infirm.
+
+```{r}
+hist(mort15$AgeDetail, breaks=20)
+median(mort15$AgeDetail)
+mean(mort15$AgeDetail)
+```
+Adults live to around 77 years old.
+The results are fairly right-skewed. Let's see how these numbers differ among the sexes.
+
+
+```{r}
+hist(mort15$AgeDetail[which(mort15$Sex =='M')], breaks=20)
+hist(mort15$AgeDetail[which(mort15$Sex =='F')], breaks=20)
+median(mort15$AgeDetail[which(mort15$Sex =='M')])
+median(mort15$AgeDetail[which(mort15$Sex =='F')])
+```
+As one often hears, women live longer than men with 82 and 75 being the respective median ages of death.
+
+
+
+What are some of the leading and least common causes of death? We'll look at the CauseRecode113 as opposed to ICD10 for a more
+general picture.
+
+```{r}
+sort(table(mort15$CauseRecode113))
+```
+
+Recodes 111, 63, 27, 86, and 70 are the most common methods of death
+7, 8, 13, 2, and 17 the least common. 
+
+From the literature we find out that these are...
+Top: Misc. Disease, Chronic Ischemic Heart Disease, Lung/Trachea/Bronchus Neoplasms ie cancer, Chronic Lung Disease, and Cerebrovascular Disease
+(including Arterio-venus malformations? Don't google this).
+Bottom: Whooping Cough, Scarlet Fever, Encephalitis, Amoeba Infection, and Malaria.
+
+
+How do some of the variables influence age of death?
+
+```{r}
+str(mort15)
+mortreg <- glm(AgeDetail ~ Education2003 + Sex + RaceRecord5 + MethodOfDisposition + MaritalStatus, data=mort15)
+summary(mortreg)
+```
+
+Doing a multiple linear regression on some choice variables reveals some interesting, and perhaps counterintuitive trends. Going down the list:
+  
+  Education - Scales positively, but quite poorly. This could be because higher education is overrepresented in younger people, since the demand for PhDs has gone up only over the past few decades.
+```{r}
+edureg <- lm(AgeDetail ~ Education2003, data=mort15)
+summary(edureg)
+```
+A look at Age v Education alone supports this hypothesis, with education actually being negatively correlated with age of death.
+
+  Sex - As we saw before women live longer on average
+    
+  Race - With 1 being white, it is no surprise that in America all others do worse.
+
+  Method of Dispotition -  Burial, Cremation, Donation, Entombment, Removal from State, Unknown, and Other are the available choices. With the high cost of burials and crypts it is no surprise that those who can afford them will live longer.
+
+  Marital Status - Married persons live longer, and Widows by far and away live longer. This could be because women, who live longer, are oversampled in the class of widows, and because widows were by definition married at some point.
+ 
+```{r}
+table(mort15$Sex[which(mort15$MaritalStatus == "W")])
+```
+
+As the results show this theory seems pretty sound.
+
+```{r}
+edureg <- NULL
+mortreg <- NULL
+```
+
+
+#Data Analysis §2 
+Now that we've gotten a look see at some of the trends let's do some more in depth analysis and computation
+
+
+  One critical factor for determining life expectancy is wealth, which is not listed in this dataset. 
+
+#Question 1: 
+Can we infer wealth information from other variables? The motivation here could be dimensionality reduction - imagine the computational speedup if this were very very big data. Or consider a situation where we didn't know if our variables had any underlying factors. 
+
+Which variables can we infer wealth from? Some familiar candidates come to mind:
+
+  Race - Unfortunately still a solid predictor of social status.
+  
+  Education - More education leads to higher paying jobs.
+  
+  Method of Dispostition - Burials are expensive. In 2014 the mean burial price was >$7000, per the mortician's association of USA. http://fortune.com/2015/10/30/cremation-death-funeral/
+ 
+  Marital Status - Married persons are on average wealthier. 
+  
+  Age: Richer people can afford to live longer
+
+
+Principle Component Analysis (PCA) is usually used to tackle this kind of problem, but it alone won't do the trick here, since it is based on techniques of analysis for numerical data. Our data is more categorical, requiring a different approach with a different distance metric.
+What are some methods of PCA for mixed data types? FactoMineR has Factor Analysis of Mixed Data (FADM) for Exploratory Data Analysis. 
+
+FADM is a combination of Correspondence Analysis for categorical variables, and PCA for numeric variables, which could work better here. However, there are still some assumptions of PCA to consider. For instance, at least for ordinal or interval variables there is an assumption of normality. It would help to deal with our age variable in some way, since it's skewed. One technique would be to transform it, another to bin it. We'll try a couple of approaches and see what works.
+
+```{r}
+#install.packages("FactoMineR")
+library(FactoMineR)
+str(mort15[,c(2,5,7,11,24)])
+hist(mort15[,5])#Not so normal
+
+levels(mort15[,24]) <-  c("w","b","n","p")
+mort15[,24]
+#Having too many variables with the same values would be confusing.
+str(mort15[,c(2,5,7,11,24)])
+
+
+
+#Since Education's binning is non-normal and not really ordinal, and since there're a small number of levels we'll treat it as a factor
+mort15[,2] <- as.factor(mort15[,2])
+
+
+mort15famd <- FAMD(mort15[,c(2,5,7,11,24)], ncp=10, graph=T)
+summary(mort15famd)
+plot(mort15famd$eig[c(3,1)], type = "b")
+```
+
+The results of a factor analysis are tricky to interperet, but the leftward skew of the graph, and relative flatness by component four indicates some correlation among the variables (we started out with five). However this is countered by the low amount of variance explained by each variable - though this could be due to noise. On the individual factor map you can see 1, W, E, and B all grouped together in the right most quadrant. Remember from our multiple linear regression these were all signs of longevity. There is a general mild downward right slope.
+
+Age Detail also points to the right. The numbers near the middle are probably education, since the effect was nowhere near as strong as race.
+This is only a low dimensional plot of the first two variables, but they do have the highest variance.
+
+There exist fancier tests of model soundness in some of the literature on PCA and MCA, but they were beyond my meager abilities.
+
+
+We tried FAMD with four categorical variables and one relatively skewed numeric variable. Next let's try transforming age into a (relatively) normal shape with binning and see if we can't get some clearer results. Ideally we could use some kind of oblique transforms on the numerical attribute to preserve its characteristic a bit better, but again these were a bit beyond my skills.
+
+```{r}
+mort15famd <- NULL
+
+
+normquantage <- quantile(mort15[,5], c(0.036,0.067,0.115,0.184,0.274,0.382,0.5,0.618,0.726,0.816,0.885,0.933,0.964)) 
+#we can use the quantile function to get cutoff ages for a more normal distribution. I looked up percentiles for zscores at 0.3 increments.
+
+
+mort15[,28] <- cut(mort15[,5], breaks=c(0,normquantage, Inf), labels=c(00,11,22,33,44,55,66,77,88,99,110,111,112,113))
+plot(mort15[,28]) #Much more normal.
+
+
+mort15famd <- FAMD(mort15[,c(2,7,11,24,28)], ncp=10, graph=T)
+#We're calling the FAMD function again, but under the hood it just runs MCA on factors.
+summary(mort15famd)
+plot(mort15famd$eig[c(3,1)], type = "b")
+
+```
+The overall trends are identical.
+The AgeDetail being on the point graph makes it a bit harder to talk about. On the whole the thing trends to the bottom left.
+The other interesting bit is that the cumulative variance for the first factors is smaller. This probably happened because of how we transformed the age data somewhat destructively, meaning all the data is that much noisier.
+  
+```{r}
+mort15famd <- NULL
+normquantage <- NULL
+```
+
+
+
+  Now for another challenge. The CDC bins cause of death into various groups named CauseRecode###, and does this mainly according to where the disease is located in the body. So we get lists which go heart disease, brain disease, lung disease, and so on. 
+
+#Question 2: 
+Can we use machine learning techniques to look for less-expected correlations among diseases? For example I've heard it said that poor dental health often leads to heart disease, though in the case of this data such RACs would probably fall under headings like "infection".
+  
+For the most part here we will be working with the X27 variable, which we loaded into its own matrix mort15cod and cleaned up. It's a huge matrix of 5000+ causes and contributing causes of death. We'll try to cluster over it to produce our own cause recodes, and look for anything surprising. Normally for clustering one uses kmeans, but this requires a distance metric which we don't really have. Instead we'll try both PAM, which uses Gower distance, and Kmodes, which looks at the modal values of our rows. Unfortunately due to the size of our matrix, and the poor scaling of these algorithms only a small sample can be clustered on my machine. With another big data tool like pyspark a more complete analysis could probably be done, but I am in R, stepped in so far...
+
+(I also looked into something called Rock clustering, which looks for links between rows, but I don't think it worked very well because of the sparse nature of our matrix and the way it scales with looser cluster tolerances. Mostly it just lumped everything into one cluster.)
+
+```{r}
+
+#install.packages("cluster")
+#mort15cod <- mort15cod[which(mort15$V44 %in% mort15cod$V44),]
+library(cluster)#For PAM
+library(klaR)#For Kmodes
+alpha<-NULL
+
+length(table(mort15$CauseRecode39))
+#For ease of comparison we'll first try the same number of clusters as one of our recodes. We'll use the smallest one because
+#It will take too long to compute if we don't.
+#It's CauseRecode39, but really only 33 of them are here to begin with since we cut the data down so much.
+
+
+set.seed(0) #For replicability
+aa <- sample(length(mort15cod$V44),size=10000) #Much more than 10000 computes too slowly on my machine.
+set.seed(0)
+alpha <- kmodes(mort15cod[aa,2:8],33,iter.max=20,weighted=F)
+#Iter controls the max number of clustering iterations, similar to centroids shuffling about in kmeans.
+#I've looked for info on the 'weighted' parameter, but the original paper referenced in the documentation has been lost down the memory hole
+#and none of the StackOverflow posts I've seen have any info. So it goes.
+
+
+sort(alpha$size,decreasing=T)
+sort(table(mort15$CauseRecode39[aa]),decreasing=T)
+
+#Right off the bat we can see a similar range of values for each cluster, so hopefully we're on the right track.
+#This is probably due to the relative infrequency of high nrac rows, meaning the initial condition dominates.
+
+
+cc<-mort15[aa,] # A convenient reference.
+
+#Here we'll look at the most and least populous clusters.
+
+ee<- trimws(unlist(names(which(sort(table(cc$ICDCode[which(as.numeric(alpha$cluster)==1)]),decreasing=T)[1:20]>0))))
+  sort(table(cc$CauseRecode39[which(as.numeric(alpha$cluster)==1)]),decreasing=T)[1:20] 
+  #ie to which cause recodes do our own clusters match most closely?
+  #Another way to look at this is alphabetically. Different Letter -> Different Style of Death.
+ff<- trimws(unlist(names(which(sort(table(cc$ICDCode[which(as.numeric(alpha$cluster)==9)]),decreasing=T)[1:20] > 0))))
+  #sort(table(cc$ICDCode[which(as.numeric(alpha$cluster)==9)]),decreasing=T)[1:20]
+gg<- trimws(unlist(names(which(sort(table(cc$ICDCode[which(as.numeric(alpha$cluster)==2)]),decreasing=T)[1:20] > 0))))
+  #sort(table(cc$ICDCode[which(as.numeric(alpha$cluster)==2)]),decreasing=T)[1:20]
+hh<- trimws(unlist(names(which(sort(table(cc$ICDCode[which(as.numeric(alpha$cluster)==25)]),decreasing=T)[1:20] > 0))))
+  #sort(table(cc$ICDCode[which(as.numeric(alpha$cluster)==25)]),decreasing=T)[1:20]
+ii<- trimws(unlist(names(which(sort(table(cc$ICDCode[which(as.numeric(alpha$cluster)==29)]),decreasing=T)[1:20] > 0))))
+  #sort(table(cc$ICDCode[which(as.numeric(alpha$cluster)==29)]),decreasing=T)[1:20]
+jj<- trimws(unlist(names(which(sort(table(cc$ICDCode[which(as.numeric(alpha$cluster)==15)]),decreasing=T)[1:20] > 0))))
+  #sort(table(cc$ICDCode[which(as.numeric(alpha$cluster)==15)]),decreasing=T)[1:20]
+
+
+
+```
+
+Here we'll finally add the icd codes from that dataset we snagged from Kaggle to make it easier to see what's in our clusters.
+
+```{r}
+
+icd <- read.csv("Icd10Code.csv")  
+icd$Code <- as.character(icd$Code) 
+#We'll finally add the icd list from kaggle
+head(icd)
+
+
+#We'll use match to return the first record of an ICD code, and see what things are listed in our groups
+
+icd$Description[match(ee, icd$Code)]
+icd$Description[match(ff, icd$Code)]
+icd$Description[match(gg, icd$Code)]
+icd$Description[match(hh, icd$Code)]
+icd$Description[match(ii, icd$Code)]
+icd$Description[match(jj, icd$Code)]
+
+
+```
+
+Unfortunately it doesn't look as though we'll get much useful information out of these clusters, as many of the top entries are listed in every cluster. Perhaps if we tried taking what is unique from the top 3?
+```{r}
+icdee <- as.character(icd$Description[match(ee, icd$Code)])
+icdff <- as.character(icd$Description[match(ff, icd$Code)])
+icdgg <- as.character(icd$Description[match(gg, icd$Code)])
+
+icdee[-which(icdee %in% c(icdff,icdgg))]
+icdff[-which(icdff %in% c(icdee,icdgg))]
+icdgg[-which(icdgg %in% c(icdee,icdff))]
+
+
+
+```
+
+Cluster 1 has Sepsis, Artery Disease, COPD, Hypertension, and Cirrhosis
+
+Cluster 2 has Parkinsons, Heart Attack, and various cancers
+
+Cluster 3 has Diabetes, Hypertension, High Cholesterol, and Breast Cancer 
+
+It's exciting that we got some sensible results, but they're not exactly new or interesting. Also more common means of death will be overrepresented here.
+
+
+Next we'll try using Daisy to scale our matrix with gower distance, and we'll also start adding in age and sex, since young men probably don't die of ovarian cancer very often. Much of this code is adapted from a post on rbloggers, listed in the project document.
+
+```{r}
+
+b <- cbind(mort15cod[aa,2:8],cc[,4:5]) #Our  newfangled mixed matrix for Pam analysis.
+set.seed(0)
+coddaisy2 <- daisy(b) #Doing the gower scaling
+
+codmatrix2 <- as.matrix(coddaisy2) #For looking at our medians
+
+
+b[which(codmatrix2 == min(codmatrix2[codmatrix2 != min(codmatrix2)]),arr.ind = TRUE)[1, ], ] #The most similar pair, two 60 something women
+
+b[which(codmatrix2 == max(codmatrix2[codmatrix2 != max(codmatrix2)]),arr.ind = TRUE)[1, ], ] #The most dissimilar pair, an elderly woman and a young man
+
+```
+
+
+
+
+The nice thing about clustering with pam using gower distance is it uses actual data points as the cluster centers.
+This lets as get a better sense of why an item is in a given cluster, based on how it matches the exemplar.
+
+One big part of clustering is deciding how many clusters your data should be described with. Silhouette width is roughly a measure of the compactness, and/or convexness of a cluster relative to its peers. The lower it goes, the more overlap you have, and the more vapid the conclusions you'll draw. It scales negatively with number of dimensions though, so you might have to sacrifice some to get enough granularity to see something interesting. Here we'll measure the average widths of clusters for various numbers of clusters. The code takes forever to run on my machine (Almost an hour for clustering up to 20), since pam time scales by at least O(N^2).
+
+```{r}
+
+sil_width <- c(NA)
+set.seed(0)
+for(i in 2:15){
+  
+  codsil2 <- pam(coddaisy2,
+                 diss = TRUE,
+                 k = i)
+  
+  sil_width[i] <- codsil2$silinfo$avg.width
+  
+}
+
+
+# Plot sihouette width (higher is better)
+
+plot(1:15, sil_width,
+     xlab = "Number of clusters",
+     ylab = "Silhouette Width")
+lines(1:19, sil_width)
+
+
+
+```
+As we can see the results aren't good to begin with. By cluster 5 we're already at terribly messy clusters. After 12 the width drops to just 0.025. We'll try just 12 clusters. We'll try the same sort of analysis we did before with kmodes and see if we can't get anything more useful out of it.
+
+```{r}
+set.seed(0)
+codpam2 <- pam(coddaisy2, k=12)
+sort(table(codpam2$clustering),decreasing=T) #The clusters are much more uniform than before, since we have less of them.
+
+
+sort(table(cc$ICDCode[which(as.numeric(codpam2$clustering)==12)]), decreasing=T)[1:20]
+#All our groups happen to have at least 20 different conditions, unlike last time - even the smaller ones.
+
+eee<- trimws(unlist(dimnames(sort(table(cc$ICDCode[which(as.numeric(codpam2$clustering)==3)]),decreasing=T)[1:20])))
+fff<- trimws(unlist(dimnames(sort(table(cc$ICDCode[which(as.numeric(codpam2$clustering)==4)]),decreasing=T)[1:20])))
+ggg<- trimws(unlist(dimnames(sort(table(cc$ICDCode[which(as.numeric(codpam2$clustering)==2)]),decreasing=T)[1:20])))
+hhh<- trimws(unlist(dimnames(sort(table(cc$ICDCode[which(as.numeric(codpam2$clustering)==1)]),decreasing=T)[1:20])))
+iii<- trimws(unlist(dimnames(sort(table(cc$ICDCode[which(as.numeric(codpam2$clustering)==8)]),decreasing=T)[1:20])))
+jjj<- trimws(unlist(dimnames(sort(table(cc$ICDCode[which(as.numeric(codpam2$clustering)==12)]),decreasing=T)[1:20])))
+
+
+
+icd$Description[match(eee, icd$Code)]
+icd$Description[match(fff, icd$Code)]
+icd$Description[match(ggg, icd$Code)]
+icd$Description[match(hhh, icd$Code)]
+icd$Description[match(iii, icd$Code)]
+icd$Description[match(jjj, icd$Code)]
+
+
+
+
+```
+
+
+  
+ 
+Just like before we've got a lot of common conditions present across the board. We'll try again to look at what's unique in these clusters.
+We can also take a look at our medoids to get a clue as to what each cluster looks like.
+
+```{r}
+cc[codpam2$medoids,c(2,5,7,15,18,24)]
+b[codpam2$medoids,]
+#I can't really tell much from these to be honest.
+
+icdeee <- as.character(icd$Description[match(eee, icd$Code)])
+icdfff <- as.character(icd$Description[match(fff, icd$Code)])
+icdggg <- as.character(icd$Description[match(ggg, icd$Code)])
+
+icdhhh <- as.character(icd$Description[match(hhh, icd$Code)])
+icdiii <- as.character(icd$Description[match(iii, icd$Code)])
+icdjjj <- as.character(icd$Description[match(jjj, icd$Code)])
+
+
+icdeee[-which(icdeee %in% c(icdfff,icdggg))]
+icdfff[-which(icdfff %in% c(icdeee,icdggg))]
+icdggg[-which(icdggg %in% c(icdeee,icdfff))]
+
+
+#We can try with more clusters this time, but our trick of only taking unique values would backfire if we added more, since there would be more overlap.
+
+icdhhh[-which(icdhhh %in% c(icdiii,icdjjj))]
+icdiii[-which(icdiii %in% c(icdhhh,icdjjj))]
+icdjjj[-which(icdjjj %in% c(icdhhh,icdiii))]
+
+```
+Cluster 1 has Prostate Cancer, Brain Cancer, and Cardiomyopathy a hardening or thickening of the muscle.
+Cluster 2 has Breast and Ovary, and White Blood Cell Cancer.
+Cluster 3 has Liver diseases, COPD, Emphysema, Bladder Cancer, and Diabetes.
+
+Cluster 4 has Dementia, Prostate and Kidney Cancer, Diabetes and Brain Haemorrage
+Cluster 5 has Pneumonia, Cirrhosis, Intestinal Inflammation, Stomach and Ovary Cancer, and MS
+Cluster 6 has High Colesterol and Poor Brain Bloodflow
+
+Once again, while very sensible there is nothing here that's all that shocking.
+It is cool at least that including sex as a variable gave us clusters for man cancer and lady cancer.
+
+
+#Question 3: 
+Does there exist stronger correlation between accident and self-harm victims than between each and the general population? 
+
+For this analysis we'll turn back to the mort15accidental dataset we put aside earlier. The first order of business will be ask which are accidental deaths and which have to do with self-harm. $MannerOfDeath has the answer for us:
+
+1 ... Accident
+2 ... Suicide
+3 ... Homicide
+4 ... Pending investigation
+5 ... Could not determine
+6 ... Self-Inflicted
+7 ... Natural - Remember these were listed under CauseRecode358 as not being medically related deaths.
+
+```{r}
+table(mort15accidental$MannerOfDeath)
+#3 is useless to us, 6 is empty, and 4 and 5 have too much uncertainty. We'll take a look at what kinds of deaths 7 has to see whether we should include them.
+
+sort(table(mort15accidental$CauseRecode358[which(mort15accidental$MannerOfDeath == 7)]), decreasing=T)
+```
+Among those listed as 'natural' are: 
+
+423 Unspecified Accidents (Which the ICD says could include workshop accidents - falling debris etc.)
+410 Choking
+456 Complications Following Medical Care
+406 Falls
+420-421 Accidental Poisonings
+
+While it's possible some of these could be better described as accidents or suicides, none of them are demanding to be treated that way. We'll just have to just trust the investigators that these were more like acts of god, and ignore them in our analysis.
+
+
+```{r}
+mort15suicide <- mort15accidental[which(mort15accidental$MannerOfDeath == 2),]
+mort15accidental <- mort15accidental[which(mort15accidental$MannerOfDeath == 1),]
+#Let's start with some basic fact finding just like before.
+#We'll check education, month and day of death, sex, age, marital status, method of disposition, and race
+c(apply(mort15suicide[,c(2,3,4,8,7,11,24)],2,table),mean(mort15suicide$AgeDetail),median(mort15suicide$AgeDetail))
+c(apply(mort15accidental[,c(2,3,4,8,7,11,24)],2,table),mean(mort15accidental$AgeDetail),median(mort15accidental$AgeDetail))
+
+```
+In general both groups die young, are overwhelmingly male, and moderately educated. Suicides are disproportionately smaller among widows (Maybe because widows are mostly formerly married women, as we saw earlier). More serious analysis will need some real statistical computations, and comparison to the population at large.
+
+```{r}
+mort15[,28]<- NULL
+mort15accidental[,28]<-rep(3, times=length(mort15accidental$V44))
+mort15suicide[,28]<-rep(2, times=length(mort15suicide$V44))
+mort15[,28]<-rep(1, times=length(mort15$V44))
+mort15kruskal <- rbind.data.frame(mort15, mort15suicide, mort15accidental)
+mort15kruskal[,28]<- as.factor(mort15kruskal[,28])
+
+with(mort15kruskal, chisq.test(V28,AgeDetail))
+
+agekrusk <- kruskal.test(AgeDetail + Education2003 ~ V28, data=mort15kruskal)
+
+ageglm <- glm(AgeDetail~V28,data=mort15kruskal)
+
+summary(ageglm)
+```
